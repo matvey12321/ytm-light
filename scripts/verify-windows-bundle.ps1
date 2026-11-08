@@ -6,6 +6,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'hash-utils.ps1')
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $package = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'package.json') | ConvertFrom-Json
 $versionPattern = [regex]::Escape($package.version)
@@ -44,7 +46,7 @@ foreach ($name in @('yt-dlp', 'ffmpeg', 'ffprobe')) {
     if ((Get-Item -LiteralPath $sidecar).Length -lt 1MB) {
         throw "Bundled sidecar looks like a placeholder or truncated download: $sidecar"
     }
-    $actualHash = (Get-FileHash -LiteralPath $sidecar -Algorithm SHA256).Hash
+    $actualHash = Get-Sha256Hex -Path $sidecar
     if ($actualHash -ne $expectedSidecarHashes[$name]) {
         throw "Bundled sidecar checksum mismatch: $sidecar"
     }

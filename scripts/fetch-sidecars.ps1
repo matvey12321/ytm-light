@@ -8,6 +8,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+. (Join-Path $PSScriptRoot 'hash-utils.ps1')
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $binDir = Join-Path $repoRoot 'src-tauri\binaries'
 
@@ -30,7 +32,7 @@ $ffmpegZipHash = '60F467265B1E312373DBCD92200C2618A74850F98D3D078E94296BB3FA2047
 function Get-Sha256 {
     param([Parameter(Mandatory)][string]$Path)
 
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+    return Get-Sha256Hex -Path $Path
 }
 
 function Test-FileHash {
@@ -115,7 +117,11 @@ try {
         Download-File -Url $ffmpegUrl -Destination $zipPath -LocalPath $FfmpegArchive
         Assert-FileHash -Path $zipPath -Expected $ffmpegZipHash -Label 'FFmpeg archive'
 
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        } catch {
+            [void][System.Reflection.Assembly]::LoadWithPartialName('System.IO.Compression.FileSystem')
+        }
         $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
         try {
             $root = "ffmpeg-$ffmpegVersion-essentials_build"

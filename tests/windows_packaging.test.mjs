@@ -119,6 +119,21 @@ test("downloader sidecars are fetched outside Git and in CI", () => {
     "powershell -NoProfile -File scripts/fetch-sidecars.ps1",
   );
 
+  // CI runners can hide Microsoft.PowerShell.Utility, so the build scripts must
+  // hash files through .NET instead of the Get-FileHash cmdlet.
+  const hashUtils = readFileSync(
+    new URL("../scripts/hash-utils.ps1", import.meta.url),
+    "utf8",
+  );
+  assert.match(hashUtils, /System\.Security\.Cryptography\.SHA256/);
+  const verifyScript = readFileSync(
+    new URL("../scripts/verify-windows-bundle.ps1", import.meta.url),
+    "utf8",
+  );
+  for (const script of [fetchScript, verifyScript]) {
+    assert.doesNotMatch(script, /Get-FileHash/);
+  }
+
   for (const workflowName of ["checks.yml", "release.yml"]) {
     const workflow = readFileSync(
       new URL(`../.github/workflows/${workflowName}`, import.meta.url),

@@ -54,6 +54,11 @@
 - Updated both GitHub Actions workflows to fetch the sidecars before testing or
   building. Tagged `v*` builds now publish the unsigned installer to GitHub
   Releases.
+- Fixed the sidecar fetch step on GitHub Actions. The runner launched Windows
+  PowerShell without `Microsoft.PowerShell.Utility`, so `Get-FileHash` was
+  missing. Both build scripts now hash files through .NET
+  (`scripts/hash-utils.ps1`), and a test guards against reintroducing the
+  cmdlet.
 - Removed stale English screenshots of the old Spotify transfer UI.
 - Added `.gitignore` rules for local secrets, editor state, crash dumps, and
   build artifacts.
