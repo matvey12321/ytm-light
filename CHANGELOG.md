@@ -59,6 +59,9 @@
   missing. Both build scripts now hash files through .NET
   (`scripts/hash-utils.ps1`), and a test guards against reintroducing the
   cmdlet.
+- Updated the workflow actions to their current major versions (`checkout` v7,
+  `setup-node` v7, `upload-artifact` v7, `setup-rust-toolchain` v2) to drop the
+  Node 20 deprecation warning.
 - Removed stale English screenshots of the old Spotify transfer UI.
 - Added `.gitignore` rules for local secrets, editor state, crash dumps, and
   build artifacts.
