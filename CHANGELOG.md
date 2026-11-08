@@ -62,6 +62,8 @@
 - Updated the workflow actions to their current major versions (`checkout` v7,
   `setup-node` v7, `upload-artifact` v7, `setup-rust-toolchain` v2) to drop the
   Node 20 deprecation warning.
+- Published the repository and added a CI status badge plus a no-support
+  disclaimer to the README.
 - Removed stale English screenshots of the old Spotify transfer UI.
 - Added `.gitignore` rules for local secrets, editor state, crash dumps, and
   build artifacts.

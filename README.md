@@ -1,11 +1,17 @@
 # YTM Light
 
+[![checks](https://github.com/matvey12321/ytm-light/actions/workflows/checks.yml/badge.svg)](https://github.com/matvey12321/ytm-light/actions/workflows/checks.yml)
+
 A lightweight, personal YouTube Music desktop client for Windows, built with
 Tauri 2 and WebView2.
 
 YTM Light is a fork of [`xzelleiv/ytm-tauri`](https://github.com/xzelleiv/ytm-tauri)
 (MIT), rebranded and trimmed for personal use. It is not affiliated with
 YouTube, Google, Discord, Microsoft, or Tauri.
+
+> **Personal project.** YTM Light is provided as-is, without support or
+> warranty. Issues may go unanswered, and features can break whenever YouTube
+> Music changes its web player. Use it at your own risk.
 
 ## Status
 
