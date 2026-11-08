@@ -1,0 +1,57 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "YTM Light",
+  "version": "0.1.0",
+  "identifier": "app.ytmlight.desktop",
+  "build": {
+    "frontendDist": "../src",
+    "devUrl": "https://music.youtube.com"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": false,
+    "targets": ["nsis"],
+    "publisher": "YTM Light",
+    "copyright": "Copyright © 2026 YTM Light contributors. Original work by xzelleiv and Henix.",
+    "licenseFile": "../LICENSE",
+    "externalBin": [
+      "binaries/yt-dlp",
+      "binaries/ffmpeg",
+      "binaries/ffprobe"
+    ],
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "binaries/ffmpeg-LICENSE.txt": "FFMPEG-LICENSE.txt"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installerHooks": "nsis/installer-hooks.nsh"
+      },
+      "wix": {
+        "fragmentPaths": [
+          "wix/app-identity.wxs"
+        ],
+        "componentGroupRefs": [
+          "AppUserModelIdentityComponents"
+        ]
+      }
+    }
+  }
+}

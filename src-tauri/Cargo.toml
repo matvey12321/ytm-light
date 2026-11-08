@@ -1,0 +1,35 @@
+[package]
+name = "ytm-light"
+version = "0.1.0"
+description = "Lightweight YouTube Music desktop client built with Tauri 2 and WebView2"
+authors = ["YTM Light contributors", "xzelleiv", "Henix (Original Creator)"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "ytm_light_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+base64 = "0.22.1"
+discord-rich-presence = { git = "https://github.com/vionya/discord-rich-presence", rev = "4311c894bbfcefda0fb682262cdd2098ff82490a" }
+md5 = "0.8.1"
+rand = "0.8.5"
+regex = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+tauri = { version = "2.11.5", features = ["tray-icon", "devtools"] }
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-notification = "2.4.0"
+tauri-plugin-single-instance = "2.4.4"
+tauri-plugin-window-state = "2.4.1"
+url = "2"
+webview2-com = "0.38.2"
+windows = { version = "0.61.3", features = ["Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.56.0"

@@ -1,0 +1,1067 @@
+use crate::{controls, settings, AppState};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, io::Read, thread, time::Duration};
+use tauri::{Manager, Url, WebviewWindow};
+
+const PREFIX: &str = "YTMFEATURE:";
+const MAX_REQUEST_BODY: usize = 256 * 1024;
+const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
+const MAX_URL_CHARS: usize = 2048;
+
+#[derive(Debug, Deserialize)]
+pub struct FeatureRequest {
+    pub id: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+    pub body: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub key: Option<String>,
+    pub value: Option<serde_json::Value>,
+    pub action: Option<String>,
+    pub download_id: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct FeatureResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<settings::Settings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<Vec<crate::downloads::DownloadJob>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download: Option<crate::downloads::DownloadJob>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn default_method() -> String {
+    "GET".to_string()
+}
+
+pub fn is_feature_title_message(title: &str) -> bool {
+    title.starts_with(PREFIX)
+}
+
+pub fn handle_title(window: &WebviewWindow, title: &str, state: &AppState) {
+    let Some(request) = parse_request(title) else {
+        return;
+    };
+
+    match request.kind.as_str() {
+        "get_settings" => {
+            let current = sanitize_settings(settings::snapshot(&state.settings));
+            let response = FeatureResponse {
+                ok: true,
+                status: Some(200),
+                body: None,
+                headers: HashMap::new(),
+                settings: Some(current),
+                downloads: None,
+                download: None,
+                error: None,
+            };
+            send_response(window, request.id, &response);
+        }
+        "set_setting" => {
+            let mut updated_settings = None;
+            if let (Some(key), Some(value)) = (&request.key, &request.value) {
+                let applied = settings::update_if(&state.settings, |settings| {
+                    apply_setting_update(settings, key, value)
+                });
+                if applied {
+                    let snap = settings::snapshot(&state.settings);
+                    if key == "discord_rpc" {
+                        state.presence.set_enabled(snap.discord_rpc);
+                    } else if key == "spotify_spoof" {
+                        state.presence.set_spotify_spoof(snap.spotify_spoof);
+                    } else if key == "ad_block" {
+                        state.adblock.set_enabled(snap.ad_block);
+                    } else if key == "launch_at_startup" || key == "start_minimized" {
+                        let _ = crate::platform::set_startup_enabled(
+                            snap.launch_at_startup,
+                            snap.start_minimized,
+                        );
+                    } else if key == "lyrics_line_effect" {
+                        crate::controls::sync_tray_effects(window.app_handle(), state);
+                    }
+                    updated_settings = Some(sanitize_settings(snap));
+                }
+            }
+            let error = if updated_settings.is_none() {
+                Some("invalid setting value".to_string())
+            } else {
+                None
+            };
+            let response = FeatureResponse {
+                ok: updated_settings.is_some(),
+                status: Some(if updated_settings.is_some() { 200 } else { 400 }),
+                body: None,
+                headers: HashMap::new(),
+                settings: updated_settings,
+                downloads: None,
+                download: None,
+                error,
+            };
+            send_response(window, request.id, &response);
+        }
+        "action" => {
+            let action_result = request
+                .action
+                .as_deref()
+                .map(|action| handle_action(window, action, state));
+            let action_ok = action_result.as_ref().map_or(true, Result::is_ok);
+            let action_error = action_result.and_then(Result::err);
+            let response = FeatureResponse {
+                ok: action_ok,
+                status: Some(if action_ok { 200 } else { 500 }),
+                body: None,
+                headers: HashMap::new(),
+                settings: Some(sanitize_settings(settings::snapshot(&state.settings))),
+                downloads: None,
+                download: None,
+                error: action_error,
+            };
+            send_response(window, request.id, &response);
+        }
+        "download" => {
+            handle_download(window, &request, state);
+        }
+        "http" => {
+            let window = window.clone();
+            thread::spawn(move || {
+                let response = execute_request(&request);
+                send_response(&window, request.id, &response);
+            });
+        }
+        _ => {}
+    }
+}
+
+fn send_response(window: &WebviewWindow, id: u64, response: &FeatureResponse) {
+    let Ok(payload_json) = serde_json::to_string(response) else {
+        return;
+    };
+    let Ok(escaped) = serde_json::to_string(&payload_json) else {
+        return;
+    };
+    let script = format!(
+        "try {{ window.__ytmFeatures?.receive?.({id}, JSON.parse({escaped})); }} catch (e) {{ console.error(e); }}"
+    );
+    let app = window.app_handle().clone();
+    let app_for_closure = app.clone();
+    let window_label = window.label().to_string();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app_for_closure.get_webview_window(&window_label) {
+            let _ = w.eval(&script);
+        }
+    });
+}
+
+fn handle_action(window: &WebviewWindow, action: &str, state: &AppState) -> Result<(), String> {
+    let app = window.app_handle();
+    match action {
+        "clear_cache" => {
+            controls::clear_cache(app);
+        }
+        "reset_session" => {
+            controls::reset_session(app, state);
+        }
+        "connect_lastfm" => {
+            crate::scrobble_auth::start_lastfm(state.settings.clone())?;
+        }
+        "disconnect_lastfm" => {
+            crate::scrobble_auth::clear_lastfm()?;
+            if let Ok(mut value) = state.settings.lock() {
+                value.lastfm_session_key = None;
+            }
+        }
+        "connect_listenbrainz" => {
+            crate::scrobble_auth::start_listenbrainz(state.settings.clone())?;
+        }
+        "disconnect_listenbrainz" => {
+            crate::scrobble_auth::clear_listenbrainz()?;
+            if let Ok(mut value) = state.settings.lock() {
+                value.listenbrainz_token = None;
+            }
+        }
+        "zoom_in" => {
+            controls::set_zoom(app, state, 0.1);
+        }
+        "zoom_out" => {
+            controls::set_zoom(app, state, -0.1);
+        }
+        "zoom_reset" => {
+            controls::reset_zoom(app, state);
+        }
+        "open_devtools" => {
+            window.open_devtools();
+        }
+        "force_close" | "exit_app" | "quit_app" => {
+            state.downloads.shutdown();
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_download(window: &WebviewWindow, request: &FeatureRequest, state: &AppState) {
+    match execute_download(state, request) {
+        Ok((downloads, download)) => {
+            let response = FeatureResponse {
+                ok: true,
+                status: Some(200),
+                body: None,
+                headers: HashMap::new(),
+                settings: None,
+                downloads,
+                download,
+                error: None,
+            };
+            send_response(window, request.id, &response);
+        }
+        Err(error) => {
+            let response = FeatureResponse {
+                ok: false,
+                status: Some(400),
+                body: None,
+                headers: HashMap::new(),
+                settings: None,
+                downloads: None,
+                download: None,
+                error: Some(error),
+            };
+            send_response(window, request.id, &response);
+        }
+    }
+}
+
+fn execute_download(
+    state: &AppState,
+    request: &FeatureRequest,
+) -> Result<
+    (
+        Option<Vec<crate::downloads::DownloadJob>>,
+        Option<crate::downloads::DownloadJob>,
+    ),
+    String,
+> {
+    let action = request.action.as_deref().unwrap_or_default();
+    let id = request.download_id;
+    match action {
+        "start" => state
+            .downloads
+            .start(&request.url, request.body.as_deref())
+            .map(|job| (None, Some(job))),
+        "list" => state.downloads.list().map(|jobs| (Some(jobs), None)),
+        "cancel" => {
+            let id = id.ok_or_else(|| "download id is required".to_string())?;
+            state.downloads.cancel(id)?;
+            state.downloads.list().map(|jobs| (Some(jobs), None))
+        }
+        "retry" => {
+            let id = id.ok_or_else(|| "download id is required".to_string())?;
+            let job = state.downloads.retry(id)?;
+            let jobs = state.downloads.list()?;
+            Ok((Some(jobs), Some(job)))
+        }
+        "remove" => {
+            let id = id.ok_or_else(|| "download id is required".to_string())?;
+            state.downloads.remove(id)?;
+            state.downloads.list().map(|jobs| (Some(jobs), None))
+        }
+        "clear_completed" => {
+            state.downloads.clear_completed()?;
+            state.downloads.list().map(|jobs| (Some(jobs), None))
+        }
+        "open_folder" => {
+            state.downloads.open_folder(id)?;
+            state.downloads.list().map(|jobs| (Some(jobs), None))
+        }
+        _ => Err("unknown download action".to_string()),
+    }
+}
+
+fn sanitize_settings(mut s: settings::Settings) -> settings::Settings {
+    s.lastfm_session_key = None;
+    s.listenbrainz_token = None;
+    s
+}
+
+pub fn apply_setting_update(
+    settings: &mut settings::Settings,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    match key {
+        "discord_rpc" => {
+            if let Some(v) = value.as_bool() {
+                settings.discord_rpc = v;
+                return true;
+            }
+        }
+        "ad_block" => {
+            if let Some(v) = value.as_bool() {
+                settings.ad_block = v;
+                return true;
+            }
+        }
+        "close_to_tray" => {
+            if let Some(v) = value.as_bool() {
+                settings.close_to_tray = v;
+                return true;
+            }
+        }
+        "launch_at_startup" => {
+            if let Some(v) = value.as_bool() {
+                settings.launch_at_startup = v;
+                return true;
+            }
+        }
+        "start_minimized" => {
+            if let Some(v) = value.as_bool() {
+                settings.start_minimized = v;
+                return true;
+            }
+        }
+        "zoom" => {
+            if let Some(v) = value.as_f64() {
+                settings.zoom = v.clamp(0.5, 2.0);
+                return true;
+            }
+        }
+        "synced_lyrics" => {
+            if let Some(v) = value.as_bool() {
+                settings.synced_lyrics = v;
+                return true;
+            }
+        }
+        "lyrics_precise_timing" => {
+            if let Some(v) = value.as_bool() {
+                settings.lyrics_precise_timing = v;
+                return true;
+            }
+        }
+        "lyrics_show_inexact" => {
+            if let Some(v) = value.as_bool() {
+                settings.lyrics_show_inexact = v;
+                return true;
+            }
+        }
+        "lyrics_show_timecodes" => {
+            if let Some(v) = value.as_bool() {
+                settings.lyrics_show_timecodes = v;
+                return true;
+            }
+        }
+        "lyrics_romanization" => {
+            if let Some(v) = value.as_bool() {
+                settings.lyrics_romanization = v;
+                return true;
+            }
+        }
+        "lyrics_auto_sync" => {
+            if let Some(v) = value.as_bool() {
+                settings.lyrics_auto_sync = v;
+                return true;
+            }
+        }
+        "lyrics_line_effect" => {
+            if let Some(
+                v @ ("fancy" | "scale" | "offset" | "focus" | "cinematic" | "studio"
+                | "luminescent"),
+            ) = value.as_str()
+            {
+                settings.lyrics_line_effect = v.to_string();
+                return true;
+            }
+        }
+        "lastfm_scrobbling" => {
+            if let Some(v) = value.as_bool() {
+                settings.lastfm_scrobbling = v;
+                return true;
+            }
+        }
+        "listenbrainz_scrobbling" => {
+            if let Some(v) = value.as_bool() {
+                settings.listenbrainz_scrobbling = v;
+                return true;
+            }
+        }
+        "notifications" => {
+            if let Some(v) = value.as_bool() {
+                settings.notifications = v;
+                return true;
+            }
+        }
+        "windows_media_controls" => {
+            if let Some(v) = value.as_bool() {
+                settings.windows_media_controls = v;
+                return true;
+            }
+        }
+        "custom_output_device" => {
+            if let Some(v) = value.as_bool() {
+                settings.custom_output_device = v;
+                return true;
+            }
+        }
+        "output_device" => {
+            if let Some(v) = value.as_str().filter(|value| value.len() <= 512) {
+                settings.output_device = v.to_string();
+                return true;
+            }
+        }
+        "equalizer" => {
+            if let Some(v) = value.as_bool() {
+                settings.equalizer = v;
+                return true;
+            }
+        }
+        "equalizer_preset" => {
+            if let Some(
+                v @ ("flat" | "bass-booster" | "bass-reducer" | "treble-booster" | "treble-reducer"
+                | "vocal-booster" | "rock" | "pop" | "electronic" | "hip-hop" | "acoustic"
+                | "classical" | "deep" | "custom"),
+            ) = value.as_str()
+            {
+                settings.equalizer_preset = v.to_string();
+                return true;
+            }
+        }
+        "equalizer_custom_gains" => {
+            if let Some(v) = value.as_str() {
+                if v.len() <= 256 {
+                    settings.equalizer_custom_gains = v.to_string();
+                    return true;
+                }
+            }
+        }
+        "precise_volume" => {
+            if let Some(v) = value.as_bool() {
+                settings.precise_volume = v;
+                return true;
+            }
+        }
+        "exponential_volume" => {
+            if let Some(v) = value.as_bool() {
+                settings.exponential_volume = v;
+                return true;
+            }
+        }
+        "volume_step" => {
+            if let Some(v) = value.as_f64() {
+                settings.volume_step = v.clamp(0.1, 10.0);
+                return true;
+            }
+        }
+        "navigation_controls" => {
+            if let Some(v) = value.as_bool() {
+                settings.navigation_controls = v;
+                return true;
+            }
+        }
+        "playback_speed" => {
+            if let Some(v) = value.as_bool() {
+                settings.playback_speed = v;
+                return true;
+            }
+        }
+        "playback_rate" => {
+            if let Some(v) = value.as_f64() {
+                settings.playback_rate = v.clamp(0.25, 3.0);
+                return true;
+            }
+        }
+        "skip_disliked" => {
+            if let Some(v) = value.as_bool() {
+                settings.skip_disliked = v;
+                return true;
+            }
+        }
+        "auto_confirm" => {
+            if let Some(v) = value.as_bool() {
+                settings.auto_confirm = v;
+                return true;
+            }
+        }
+        "sponsorblock" => {
+            if let Some(v) = value.as_bool() {
+                settings.sponsorblock = v;
+                return true;
+            }
+        }
+        "blur_nav_bar" => {
+            if let Some(v) = value.as_bool() {
+                settings.blur_nav_bar = v;
+                return true;
+            }
+        }
+        "disable_autoplay" => {
+            if let Some(v) = value.as_bool() {
+                settings.disable_autoplay = v;
+                return true;
+            }
+        }
+        "video_quick_toggle" => {
+            if let Some(v) = value.as_bool() {
+                settings.video_quick_toggle = v;
+                return true;
+            }
+        }
+        "ambient_mode" => {
+            if let Some(v) = value.as_bool() {
+                settings.ambient_mode = v;
+                return true;
+            }
+        }
+        "theme" => {
+            if let Some(v @ ("default" | "amoled" | "midnight" | "custom")) = value.as_str() {
+                settings.theme = v.to_string();
+                return true;
+            }
+        }
+        "custom_css" => {
+            if let Some(v) = value.as_str() {
+                if v.len() <= settings::MAX_CUSTOM_CSS_BYTES {
+                    settings.custom_css = v.to_string();
+                    return true;
+                }
+            }
+        }
+        "crossfade" => {
+            if let Some(v) = value.as_bool() {
+                settings.crossfade = v;
+                return true;
+            }
+        }
+        "crossfade_seconds" => {
+            if let Some(v) = value.as_f64() {
+                settings.crossfade_seconds = v.clamp(1.0, 15.0);
+                return true;
+            }
+        }
+        "crossfade_curve" => {
+            if let Some(v @ ("equal-power" | "logarithmic" | "linear")) = value.as_str() {
+                settings.crossfade_curve = v.to_string();
+                return true;
+            }
+        }
+        "spotify_spoof" => {
+            if let Some(v) = value.as_bool() {
+                settings.spotify_spoof = v;
+                return true;
+            }
+        }
+        "downloads_enabled" => {
+            if let Some(v) = value.as_bool() {
+                settings.downloads_enabled = v;
+                return true;
+            }
+        }
+        "download_dir" => {
+            if let Some(v) = value
+                .as_str()
+                .filter(|v| v.len() <= 1024 && !v.contains('\0'))
+            {
+                let v = v.trim();
+                if v.is_empty() || std::path::Path::new(v).is_absolute() {
+                    settings.download_dir = v.to_string();
+                    return true;
+                }
+            }
+        }
+        "download_format" => {
+            if let Some(v @ ("best" | "m4a" | "mp3" | "opus" | "flac")) = value.as_str() {
+                settings.download_format = v.to_string();
+                return true;
+            }
+        }
+        "download_bitrate" => {
+            if let Some(v @ ("128" | "192" | "256" | "320")) = value.as_str() {
+                settings.download_bitrate = v.to_string();
+                return true;
+            }
+        }
+        "download_sponsorblock" => {
+            if let Some(v @ ("off" | "mark" | "remove")) = value.as_str() {
+                settings.download_sponsorblock = v.to_string();
+                return true;
+            }
+        }
+        "download_sponsorblock_categories" => {
+            if let Some(v) = value.as_str().filter(|v| v.len() <= 256) {
+                settings.download_sponsorblock_categories = v.to_string();
+                return true;
+            }
+        }
+        "download_filename_template" => {
+            if let Some(v) = value
+                .as_str()
+                .filter(|v| v.len() <= 256 && !v.contains('\0'))
+            {
+                settings.download_filename_template = v.trim().to_string();
+                return true;
+            }
+        }
+        "download_cookies_browser" => {
+            if let Some(
+                v @ ("none" | "edge" | "chrome" | "firefox" | "brave" | "opera" | "vivaldi"),
+            ) = value.as_str()
+            {
+                settings.download_cookies_browser = v.to_string();
+                return true;
+            }
+        }
+        "download_embed_metadata" => {
+            if let Some(v) = value.as_bool() {
+                settings.download_embed_metadata = v;
+                return true;
+            }
+        }
+        "download_embed_thumbnail" => {
+            if let Some(v) = value.as_bool() {
+                settings.download_embed_thumbnail = v;
+                return true;
+            }
+        }
+        "download_concurrency" => {
+            if let Some(v) = value.as_u64() {
+                settings.download_concurrency = (v as u32).clamp(1, 3);
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn parse_request(title: &str) -> Option<FeatureRequest> {
+    let raw = title.strip_prefix(PREFIX)?;
+    let request: FeatureRequest = serde_json::from_str(raw).ok()?;
+
+    match request.kind.as_str() {
+        "get_settings" => Some(request),
+        "set_setting" => {
+            if request.key.is_some() && request.value.is_some() {
+                Some(request)
+            } else {
+                None
+            }
+        }
+        "action" => {
+            if request.action.is_some() {
+                Some(request)
+            } else {
+                None
+            }
+        }
+        "download" => {
+            let action = request.action.as_deref()?;
+            if !matches!(
+                action,
+                "start"
+                    | "list"
+                    | "cancel"
+                    | "retry"
+                    | "remove"
+                    | "clear_completed"
+                    | "open_folder"
+            ) {
+                return None;
+            }
+            if request.url.len() > MAX_URL_CHARS
+                || request
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.len() > MAX_REQUEST_BODY)
+            {
+                return None;
+            }
+            if action == "start" && request.url.trim().is_empty() {
+                return None;
+            }
+            if matches!(action, "cancel" | "retry" | "remove") && request.download_id.is_none() {
+                return None;
+            }
+            Some(request)
+        }
+        "http" => {
+            if !matches!(request.method.as_str(), "GET" | "POST") {
+                return None;
+            }
+            if request
+                .body
+                .as_ref()
+                .is_some_and(|body| body.len() > MAX_REQUEST_BODY)
+            {
+                return None;
+            }
+            let url = Url::parse(&request.url).ok()?;
+            if url.scheme() != "https" || !url.host_str().is_some_and(is_allowed_host) {
+                return None;
+            }
+            Some(request)
+        }
+        _ => None,
+    }
+}
+
+fn execute_request(request: &FeatureRequest) -> FeatureResponse {
+    let client = match reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            let target = attempt.url();
+            if target.scheme() == "https" && target.host_str().is_some_and(is_allowed_host) {
+                attempt.follow()
+            } else {
+                attempt.error("redirect target is not allowed")
+            }
+        }))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!(
+            "ytm-light/",
+            env!("CARGO_PKG_VERSION"),
+            " (local build)"
+        ))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return error_response(error.to_string()),
+    };
+
+    let mut builder = match request.method.as_str() {
+        "POST" => client.post(&request.url),
+        _ => client.get(&request.url),
+    };
+
+    for (name, value) in &request.headers {
+        if is_allowed_header(name) {
+            builder = builder.header(name, value);
+        }
+    }
+    if let Some(body) = &request.body {
+        builder = builder.body(body.clone());
+    }
+
+    let response = match builder.send() {
+        Ok(response) => response,
+        Err(error) => return error_response(error.to_string()),
+    };
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BODY as u64)
+    {
+        return error_response("response too large".to_string());
+    }
+    let mut limited = response.take((MAX_RESPONSE_BODY + 1) as u64);
+    let mut body = Vec::with_capacity(16 * 1024);
+    if let Err(error) = limited.read_to_end(&mut body) {
+        return error_response(error.to_string());
+    }
+    if body.len() > MAX_RESPONSE_BODY {
+        return error_response("response too large".to_string());
+    }
+    let body = match String::from_utf8(body) {
+        Ok(body) => body,
+        Err(error) => return error_response(error.to_string()),
+    };
+
+    FeatureResponse {
+        ok: (200..300).contains(&status),
+        status: Some(status),
+        body: Some(body),
+        headers,
+        settings: None,
+        downloads: None,
+        download: None,
+        error: None,
+    }
+}
+
+fn error_response(error: String) -> FeatureResponse {
+    FeatureResponse {
+        ok: false,
+        status: None,
+        body: None,
+        headers: HashMap::new(),
+        settings: None,
+        downloads: None,
+        download: None,
+        error: Some(error),
+    }
+}
+
+fn is_allowed_host(host: &str) -> bool {
+    matches!(
+        host,
+        "lrclib.net"
+            | "genius.com"
+            | "www.genius.com"
+            | "megalobiz.com"
+            | "www.megalobiz.com"
+            | "apic-desktop.musixmatch.com"
+            | "ytmbrowseproxy.zvz.be"
+            | "b-ytmbrowseproxy.zvz.be"
+            | "sponsor.ajay.app"
+            | "open.spotify.com"
+    )
+}
+
+fn is_allowed_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "accept" | "content-type" | "lrclib-client" | "x-user-agent" | "user-agent"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_known_provider_hosts_are_allowed() {
+        assert!(is_allowed_host("lrclib.net"));
+        assert!(is_allowed_host("genius.com"));
+        assert!(is_allowed_host("apic-desktop.musixmatch.com"));
+        assert!(is_allowed_host("open.spotify.com"));
+        assert!(!is_allowed_host("api.spotify.com"));
+        assert!(!is_allowed_host("example.com"));
+        assert!(!is_allowed_host("lrclib.net.example.com"));
+    }
+
+    #[test]
+    fn remote_page_cannot_forward_credentials_through_the_http_bridge() {
+        assert!(is_allowed_header("Accept"));
+        assert!(is_allowed_header("User-Agent"));
+        assert!(!is_allowed_header("Cookie"));
+        assert!(!is_allowed_header("Authorization"));
+        assert!(!is_allowed_header("Authority"));
+    }
+
+    #[test]
+    fn bridge_rejects_unknown_urls_and_methods() {
+        let external = r#"YTMFEATURE:{"id":1,"kind":"http","url":"https://example.com/"}"#;
+        let method = r#"YTMFEATURE:{"id":1,"kind":"http","url":"https://lrclib.net/api/search","method":"DELETE"}"#;
+
+        assert!(parse_request(external).is_none());
+        assert!(parse_request(method).is_none());
+    }
+
+    #[test]
+    fn bridge_accepts_known_provider_requests() {
+        let request =
+            r#"YTMFEATURE:{"id":7,"kind":"http","url":"https://lrclib.net/api/search?q=test"}"#;
+        let parsed = parse_request(request).expect("request");
+
+        assert_eq!(parsed.id, 7);
+        assert_eq!(parsed.method, "GET");
+    }
+
+    #[test]
+    fn bridge_accepts_settings_requests() {
+        let get = r#"YTMFEATURE:{"id":2,"kind":"get_settings"}"#;
+        let parsed = parse_request(get).expect("get settings");
+        assert_eq!(parsed.kind, "get_settings");
+
+        let set = r#"YTMFEATURE:{"id":3,"kind":"set_setting","key":"synced_lyrics","value":true}"#;
+        let parsed = parse_request(set).expect("set setting");
+        assert_eq!(parsed.kind, "set_setting");
+        assert_eq!(parsed.key.as_deref(), Some("synced_lyrics"));
+    }
+
+    #[test]
+    fn bridge_accepts_download_requests_and_rejects_incomplete_ones() {
+        let start = r#"YTMFEATURE:{"id":1,"kind":"download","action":"start","url":"https://music.youtube.com/watch?v=dQw4w9WgXcQ","body":"{\"format\":\"mp3\"}"}"#;
+        let parsed = parse_request(start).expect("download start");
+        assert_eq!(parsed.action.as_deref(), Some("start"));
+
+        let list = r#"YTMFEATURE:{"id":2,"kind":"download","action":"list"}"#;
+        assert!(parse_request(list).is_some());
+
+        let cancel = r#"YTMFEATURE:{"id":3,"kind":"download","action":"cancel"}"#;
+        assert!(parse_request(cancel).is_none());
+
+        let cancel_with_id =
+            r#"YTMFEATURE:{"id":4,"kind":"download","action":"cancel","download_id":7}"#;
+        assert!(parse_request(cancel_with_id).is_some());
+
+        let unknown = r#"YTMFEATURE:{"id":5,"kind":"download","action":"delete_everything"}"#;
+        assert!(parse_request(unknown).is_none());
+
+        let empty_start = r#"YTMFEATURE:{"id":6,"kind":"download","action":"start","url":""}"#;
+        assert!(parse_request(empty_start).is_none());
+    }
+
+    #[test]
+    fn download_setting_updates_validate_choices() {
+        let mut settings = settings::Settings::default();
+
+        assert!(apply_setting_update(
+            &mut settings,
+            "download_format",
+            &serde_json::json!("mp3")
+        ));
+        assert_eq!(settings.download_format, "mp3");
+        assert!(!apply_setting_update(
+            &mut settings,
+            "download_format",
+            &serde_json::json!("exe")
+        ));
+        assert_eq!(settings.download_format, "mp3");
+
+        assert!(apply_setting_update(
+            &mut settings,
+            "download_concurrency",
+            &serde_json::json!(9)
+        ));
+        assert_eq!(settings.download_concurrency, 3);
+
+        assert!(apply_setting_update(
+            &mut settings,
+            "download_sponsorblock_categories",
+            &serde_json::json!("sponsor,intro,unknown")
+        ));
+        assert_eq!(
+            settings.download_sponsorblock_categories,
+            "sponsor,intro,unknown"
+        );
+    }
+
+    #[test]
+    fn theme_setting_updates_validate_presets_and_css_size() {
+        let mut settings = settings::Settings::default();
+
+        assert!(apply_setting_update(
+            &mut settings,
+            "theme",
+            &serde_json::json!("midnight")
+        ));
+        assert_eq!(settings.theme, "midnight");
+        assert!(!apply_setting_update(
+            &mut settings,
+            "theme",
+            &serde_json::json!("unknown")
+        ));
+
+        let css = "body { color: red; }";
+        assert!(apply_setting_update(
+            &mut settings,
+            "custom_css",
+            &serde_json::json!(css)
+        ));
+        assert_eq!(settings.custom_css, css);
+        assert!(!apply_setting_update(
+            &mut settings,
+            "custom_css",
+            &serde_json::json!("x".repeat(settings::MAX_CUSTOM_CSS_BYTES + 1))
+        ));
+        assert_eq!(settings.custom_css, css);
+    }
+
+    #[test]
+    fn auto_confirm_setting_updates_validate_boolean() {
+        let mut settings = settings::Settings::default();
+        assert!(settings.auto_confirm);
+
+        assert!(apply_setting_update(
+            &mut settings,
+            "auto_confirm",
+            &serde_json::json!(false)
+        ));
+        assert!(!settings.auto_confirm);
+        assert!(!apply_setting_update(
+            &mut settings,
+            "auto_confirm",
+            &serde_json::json!("yes")
+        ));
+        assert!(!settings.auto_confirm);
+    }
+
+    #[test]
+    fn setting_updates_reject_unknown_enums_and_bound_numbers() {
+        let mut settings = settings::Settings::default();
+        assert!(!apply_setting_update(
+            &mut settings,
+            "lyrics_line_effect",
+            &serde_json::json!("invalid")
+        ));
+        for effect in ["cinematic", "studio", "luminescent"] {
+            assert!(apply_setting_update(
+                &mut settings,
+                "lyrics_line_effect",
+                &serde_json::json!(effect)
+            ));
+            assert_eq!(settings.lyrics_line_effect, effect);
+        }
+        assert!(apply_setting_update(
+            &mut settings,
+            "zoom",
+            &serde_json::json!(99.0)
+        ));
+        assert_eq!(settings.zoom, 2.0);
+        assert!(!apply_setting_update(
+            &mut settings,
+            "unknown_setting",
+            &serde_json::json!(true)
+        ));
+        assert!(apply_setting_update(
+            &mut settings,
+            "crossfade_seconds",
+            &serde_json::json!(25.0)
+        ));
+        assert_eq!(settings.crossfade_seconds, 15.0);
+        assert!(apply_setting_update(
+            &mut settings,
+            "crossfade_curve",
+            &serde_json::json!("logarithmic")
+        ));
+        assert_eq!(settings.crossfade_curve, "logarithmic");
+        assert!(!apply_setting_update(
+            &mut settings,
+            "crossfade_curve",
+            &serde_json::json!("exponential")
+        ));
+        assert!(apply_setting_update(
+            &mut settings,
+            "equalizer_preset",
+            &serde_json::json!("electronic")
+        ));
+        assert_eq!(settings.equalizer_preset, "electronic");
+        assert!(!apply_setting_update(
+            &mut settings,
+            "equalizer_preset",
+            &serde_json::json!("techno")
+        ));
+        assert!(apply_setting_update(
+            &mut settings,
+            "equalizer_custom_gains",
+            &serde_json::json!("1,2,3,4,5,6,5,4,3,2")
+        ));
+        assert_eq!(settings.equalizer_custom_gains, "1,2,3,4,5,6,5,4,3,2");
+    }
+}
